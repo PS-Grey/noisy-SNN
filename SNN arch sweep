@@ -1,0 +1,657 @@
+"""
+SNN Architectural Diversity Sweep
+=================================
+Goal: Push SNN accuracy toward 100% on Fashion-MNIST.
+Find which architectural parameter creates the most useful diversity.
+Test temperature-scaled soft voting for emergence.
+
+Approach:
+  1. Sweep one parameter at a time (hidden_size, num_steps, beta, threshold)
+  2. All networks trained with membrane noise (0.4) — proven regulariser
+  3. Measure pairwise error correlation within and across sweeps
+  4. Test soft voting with temperature sweep for emergence
+  5. Find the single best architecture and best ensemble
+
+Run: Google Colab, GPU runtime. ~60-90 minutes.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import numpy as np
+import json
+from itertools import combinations
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+CONFIG = {
+    'input_size': 784,
+    'output_size': 10,
+    'batch_size': 256,
+    'epochs': 25,
+    'lr': 1e-3,
+    'noise_std': 0.4,
+    'dropout_rate': 0.1,
+
+    # Baseline architecture (held constant except for swept param)
+    'base': {
+        'hidden_size': 256,
+        'num_steps': 25,
+        'beta_init': 0.9,
+        'threshold': 1.0,
+        'n_layers': 1,
+    },
+
+    # Sweeps — one parameter varied at a time
+    'sweeps': {
+        'hidden_size': [64, 128, 256, 384, 512],
+        'num_steps':   [5, 10, 15, 25, 40],
+        'beta_init':   [0.3, 0.5, 0.7, 0.9, 0.95],
+        'threshold':   [0.5, 0.75, 1.0, 1.5, 2.0],
+    },
+
+    # Temperature sweep for soft voting
+    'temperatures': [0.25, 0.5, 1.0, 2.0, 3.0, 5.0],
+
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+}
+
+print(f"Device: {CONFIG['device']}")
+
+# ============================================================
+# SURROGATE GRADIENT
+# ============================================================
+
+class SurrogateSpike(torch.autograd.Function):
+    scale = 25.0
+    @staticmethod
+    def forward(ctx, membrane):
+        spikes = (membrane > 0).float()
+        ctx.save_for_backward(membrane)
+        return spikes
+    @staticmethod
+    def backward(ctx, grad_output):
+        membrane, = ctx.saved_tensors
+        sigmoid = torch.sigmoid(SurrogateSpike.scale * membrane)
+        return grad_output * sigmoid * (1 - sigmoid) * SurrogateSpike.scale
+
+spike_fn = SurrogateSpike.apply
+
+# ============================================================
+# FLEXIBLE SNN MODEL
+# ============================================================
+
+class FlexibleSNN(nn.Module):
+    """
+    SNN with configurable architecture for diversity sweep.
+    Supports variable hidden size, timesteps, leak rate, threshold, and depth.
+    """
+    def __init__(self, input_size, hidden_size, output_size, num_steps,
+                 beta_init=0.9, threshold=1.0, n_layers=1,
+                 noise_std=0.0, dropout_rate=0.0):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_steps = num_steps
+        self.threshold = threshold
+        self.noise_std = noise_std
+        self.n_layers = n_layers
+
+        # Build layers
+        self.layers = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        self.betas = nn.ParameterList()
+
+        # First layer
+        self.layers.append(nn.Linear(input_size, hidden_size))
+        self.bns.append(nn.BatchNorm1d(hidden_size))
+        self.betas.append(nn.Parameter(torch.ones(hidden_size) * beta_init))
+
+        # Additional hidden layers
+        for _ in range(n_layers - 1):
+            self.layers.append(nn.Linear(hidden_size, hidden_size))
+            self.bns.append(nn.BatchNorm1d(hidden_size))
+            self.betas.append(nn.Parameter(torch.ones(hidden_size) * beta_init))
+
+        # Output layer
+        self.fc_out = nn.Linear(hidden_size, output_size)
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        device = x.device
+        x = x.view(batch_size, -1)
+
+        # Process through each LIF layer
+        current_input = x
+        total_spikes = 0
+        total_neurons = 0
+
+        for layer_idx in range(self.n_layers):
+            fc = self.layers[layer_idx]
+            bn = self.bns[layer_idx]
+            beta = torch.sigmoid(self.betas[layer_idx])
+
+            projected = fc(current_input)
+            projected = bn(projected)
+
+            membrane = torch.zeros(batch_size, self.hidden_size, device=device)
+            spike_sum = torch.zeros(batch_size, self.hidden_size, device=device)
+
+            for t in range(self.num_steps):
+                membrane = beta * membrane + projected
+                if self.training and self.noise_std > 0:
+                    membrane = membrane + torch.randn_like(membrane) * self.noise_std
+                spikes = spike_fn(membrane - self.threshold)
+                membrane = membrane * (1 - spikes)
+                if self.dropout is not None:
+                    spikes = self.dropout(spikes)
+                spike_sum += spikes
+                total_spikes += spikes.sum().item()
+                total_neurons += spikes.numel()
+
+            # Output of this layer feeds into next (or into readout)
+            current_input = spike_sum / self.num_steps
+
+        # Readout
+        output = self.fc_out(current_input)
+        activation_rate = total_spikes / total_neurons if total_neurons > 0 else 0
+
+        return output, activation_rate
+
+    def describe(self):
+        return (f"h={self.hidden_size}, T={self.num_steps}, "
+                f"β={float(torch.sigmoid(self.betas[0]).mean()):.2f}, "
+                f"θ={self.threshold}, L={self.n_layers}")
+
+# ============================================================
+# DATA
+# ============================================================
+
+def load_data(config):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.2860,), (0.3530,))
+    ])
+    train_data = datasets.FashionMNIST('./data', train=True, download=True, transform=transform)
+    test_data = datasets.FashionMNIST('./data', train=False, download=True, transform=transform)
+    train_loader = DataLoader(train_data, batch_size=config['batch_size'],
+                              shuffle=True, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_data, batch_size=config['batch_size'],
+                             shuffle=False, num_workers=2, pin_memory=True)
+    return train_loader, test_loader
+
+# ============================================================
+# TRAINING & EVALUATION
+# ============================================================
+
+def train_snn(model, train_loader, config, name="SNN"):
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, config['epochs'])
+    criterion = nn.CrossEntropyLoss()
+    device = config['device']
+    model = model.to(device)
+
+    for epoch in range(config['epochs']):
+        model.train()
+        correct = 0
+        total = 0
+        total_loss = 0
+
+        for data, target in train_loader:
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            output, _ = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total_loss += loss.item()
+            _, predicted = output.max(1)
+            correct += predicted.eq(target).sum().item()
+            total += target.size(0)
+
+        scheduler.step()
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"    {name} Epoch {epoch+1}/{config['epochs']}: "
+                  f"Loss={total_loss/len(train_loader):.4f}, Acc={100.*correct/total:.1f}%")
+
+    return model
+
+
+def evaluate_snn(model, test_loader, config):
+    device = config['device']
+    model.eval()
+    model = model.to(device)
+
+    all_logits = []
+    all_probs = []
+    all_preds = []
+    all_targets = []
+    all_correct = []
+    total_activation = 0
+    n_batches = 0
+
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            output, act_rate = model(data)
+            total_activation += act_rate
+            n_batches += 1
+
+            probs = F.softmax(output, dim=1)
+            pred = probs.argmax(dim=1)
+
+            all_logits.append(output.cpu())
+            all_probs.append(probs.cpu())
+            all_preds.append(pred.cpu())
+            all_targets.append(target.cpu())
+            all_correct.append(pred.eq(target).cpu())
+
+    return {
+        'logits': torch.cat(all_logits),
+        'probs': torch.cat(all_probs),
+        'preds': torch.cat(all_preds),
+        'targets': torch.cat(all_targets),
+        'correct': torch.cat(all_correct),
+        'accuracy': torch.cat(all_correct).float().mean().item(),
+        'activation_rate': total_activation / n_batches,
+    }
+
+# ============================================================
+# ENSEMBLE ANALYSIS WITH TEMPERATURE
+# ============================================================
+
+def soft_vote_with_temperature(results_list, targets, temperature=1.0):
+    """
+    Soft voting with temperature scaling.
+    T<1: sharpen (trust first choices more)
+    T=1: standard soft vote
+    T>1: flatten (amplify second/third choices)
+    """
+    # Stack logits and apply temperature before softmax
+    all_logits = torch.stack([r['logits'] for r in results_list])  # [N, samples, classes]
+    all_correct = torch.stack([r['correct'] for r in results_list])
+
+    # Temperature-scaled softmax per network, then average
+    tempered_probs = F.softmax(all_logits / temperature, dim=2)
+    mean_probs = tempered_probs.mean(dim=0)  # [samples, classes]
+
+    soft_preds = mean_probs.argmax(dim=1)
+    soft_correct = soft_preds.eq(targets)
+    soft_accuracy = soft_correct.float().mean().item()
+
+    # Emergence: all individuals wrong, soft vote right
+    all_wrong = (all_correct.sum(dim=0) == 0)
+    emergence_mask = all_wrong & soft_correct
+    emergence_count = emergence_mask.sum().item()
+
+    # Per-class emergence
+    per_class_emergence = {}
+    for c in range(10):
+        mask = (targets == c)
+        if mask.sum() > 0:
+            per_class_emergence[c] = (emergence_mask & mask).sum().item()
+
+    # Analyse emergence examples
+    emergence_details = []
+    if emergence_count > 0:
+        emergence_idx = torch.where(emergence_mask)[0][:15]
+        all_preds = torch.stack([r['preds'] for r in results_list])
+        for idx in emergence_idx:
+            i = idx.item()
+            true_label = targets[i].item()
+            n_models = len(results_list)
+            ranks = []
+            probs_true = []
+            for m in range(n_models):
+                p = tempered_probs[m, i]
+                rank = (p > p[true_label]).sum().item() + 1
+                ranks.append(rank)
+                probs_true.append(float(p[true_label]))
+            emergence_details.append({
+                'idx': i,
+                'true': true_label,
+                'soft_pred': soft_preds[i].item(),
+                'avg_prob_true': float(mean_probs[i, true_label]),
+                'ranks': ranks,
+                'probs_true': probs_true,
+                'individual_preds': [int(all_preds[m, i]) for m in range(n_models)],
+            })
+
+    return {
+        'accuracy': soft_accuracy,
+        'emergence_count': emergence_count,
+        'emergence_rate': emergence_count / len(targets),
+        'per_class_emergence': per_class_emergence,
+        'emergence_details': emergence_details,
+    }
+
+
+def pairwise_error_correlation(results_list):
+    """Compute mean pairwise error correlation across all model pairs."""
+    n = len(results_list)
+    correlations = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            err_i = (~results_list[i]['correct']).float()
+            err_j = (~results_list[j]['correct']).float()
+            if err_i.std() > 0 and err_j.std() > 0:
+                corr = torch.corrcoef(torch.stack([err_i, err_j]))[0, 1].item()
+                correlations.append(corr)
+    return np.mean(correlations) if correlations else 0
+
+# ============================================================
+# MAIN EXPERIMENT
+# ============================================================
+
+CLASS_NAMES = ['T-shirt', 'Trouser', 'Pullover', 'Dress', 'Coat',
+               'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Boot']
+
+def run_experiment():
+    config = CONFIG
+    base = config['base']
+
+    print("=" * 65)
+    print("SNN ARCHITECTURAL DIVERSITY SWEEP")
+    print("Goal: push SNN accuracy ceiling, find diversity that matters")
+    print("=" * 65)
+
+    # Load data
+    print("\n[1] Loading Fashion-MNIST...")
+    train_loader, test_loader = load_data(config)
+
+    # ============================================================
+    # TRAIN ALL ARCHITECTURES
+    # ============================================================
+    all_models = {}
+    all_results = {}
+
+    sweep_configs = {}
+    for param_name, values in config['sweeps'].items():
+        for val in values:
+            arch = dict(base)
+            arch[param_name] = val
+            key = f"{param_name}={val}"
+            sweep_configs[key] = {
+                'param': param_name,
+                'value': val,
+                'arch': arch,
+            }
+
+    n_total = len(sweep_configs)
+    print(f"\n[2] Training {n_total} architectures...")
+    print(f"    (4 sweeps × 5 values, baseline appears in each sweep)\n")
+
+    for i, (key, sc) in enumerate(sweep_configs.items()):
+        arch = sc['arch']
+        print(f"  [{i+1}/{n_total}] {key}")
+
+        # Deterministic seed per architecture (index-based, not hash-based)
+        seed = 42 + i * 7919  # prime spacing avoids collisions
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+        model = FlexibleSNN(
+            input_size=config['input_size'],
+            output_size=config['output_size'],
+            hidden_size=arch['hidden_size'],
+            num_steps=arch['num_steps'],
+            beta_init=arch['beta_init'],
+            threshold=arch['threshold'],
+            n_layers=arch['n_layers'],
+            noise_std=config['noise_std'],
+            dropout_rate=config['dropout_rate'],
+        )
+
+        model = train_snn(model, train_loader, config, name=key)
+        result = evaluate_snn(model, test_loader, config)
+
+        all_models[key] = model
+        all_results[key] = result
+
+        print(f"    → Accuracy: {result['accuracy']*100:.1f}%, "
+              f"Activation: {result['activation_rate']:.3f}\n")
+
+    # ============================================================
+    # [3] INDIVIDUAL RESULTS BY SWEEP
+    # ============================================================
+    print(f"\n{'='*65}")
+    print("INDIVIDUAL ACCURACY BY SWEEP")
+    print(f"{'='*65}")
+
+    best_overall_key = None
+    best_overall_acc = 0
+
+    for param_name in config['sweeps']:
+        values = config['sweeps'][param_name]
+        print(f"\n  Sweep: {param_name}")
+        print(f"  {'Value':>10} | {'Accuracy':>8} | {'Activation':>10} | {'Errors':>6}")
+        print(f"  {'-'*45}")
+
+        for val in values:
+            key = f"{param_name}={val}"
+            r = all_results[key]
+            errors = int((1 - r['accuracy']) * 10000)
+            marker = " ←base" if val == base[param_name] else ""
+            print(f"  {str(val):>10} | {r['accuracy']*100:>7.1f}% | "
+                  f"{r['activation_rate']:>10.3f} | {errors:>6}{marker}")
+
+            if r['accuracy'] > best_overall_acc:
+                best_overall_acc = r['accuracy']
+                best_overall_key = key
+
+    print(f"\n  BEST SINGLE ARCHITECTURE: {best_overall_key} → {best_overall_acc*100:.1f}%")
+
+    # ============================================================
+    # [4] ERROR CORRELATION WITHIN EACH SWEEP
+    # ============================================================
+    print(f"\n{'='*65}")
+    print("ERROR CORRELATION WITHIN SWEEPS")
+    print("(lower = more diverse errors = better for ensembles)")
+    print(f"{'='*65}")
+
+    sweep_correlations = {}
+    for param_name in config['sweeps']:
+        values = config['sweeps'][param_name]
+        keys = [f"{param_name}={v}" for v in values]
+        results = [all_results[k] for k in keys]
+        mean_corr = pairwise_error_correlation(results)
+        sweep_correlations[param_name] = mean_corr
+
+        # Also compute pairwise matrix
+        n = len(results)
+        print(f"\n  {param_name}: mean correlation = {mean_corr:.4f}")
+        print(f"  {'':>10}", end="")
+        for v in values:
+            print(f" {str(v):>8}", end="")
+        print()
+        for i, vi in enumerate(values):
+            print(f"  {str(vi):>10}", end="")
+            for j, vj in enumerate(values):
+                if i == j:
+                    print(f" {'—':>8}", end="")
+                elif j > i:
+                    err_i = (~results[i]['correct']).float()
+                    err_j = (~results[j]['correct']).float()
+                    if err_i.std() > 0 and err_j.std() > 0:
+                        c = torch.corrcoef(torch.stack([err_i, err_j]))[0, 1].item()
+                        print(f" {c:>8.3f}", end="")
+                    else:
+                        print(f" {'N/A':>8}", end="")
+                else:
+                    print(f" {'':>8}", end="")
+            print()
+
+    # Rank sweeps by diversity
+    print(f"\n  DIVERSITY RANKING (most diverse first):")
+    ranked = sorted(sweep_correlations.items(), key=lambda x: x[1])
+    for rank, (param, corr) in enumerate(ranked, 1):
+        print(f"    {rank}. {param}: {corr:.4f}")
+
+    most_diverse_param = ranked[0][0]
+    print(f"\n  → {most_diverse_param} produces the most diverse errors")
+
+    # ============================================================
+    # [5] CROSS-SWEEP CORRELATION (best pair from any sweep)
+    # ============================================================
+    print(f"\n{'='*65}")
+    print("BEST PAIRS ACROSS ALL ARCHITECTURES")
+    print(f"{'='*65}")
+
+    all_keys = list(all_results.keys())
+    all_pairs = []
+    for i, ki in enumerate(all_keys):
+        for j, kj in enumerate(all_keys):
+            if j <= i:
+                continue
+            ri = all_results[ki]
+            rj = all_results[kj]
+            err_i = (~ri['correct']).float()
+            err_j = (~rj['correct']).float()
+            if err_i.std() > 0 and err_j.std() > 0:
+                corr = torch.corrcoef(torch.stack([err_i, err_j]))[0, 1].item()
+                # Soft vote accuracy for this pair
+                mean_probs = (ri['probs'] + rj['probs']) / 2
+                pair_pred = mean_probs.argmax(dim=1)
+                pair_acc = pair_pred.eq(ri['targets']).float().mean().item()
+                all_pairs.append({
+                    'key_i': ki, 'key_j': kj,
+                    'corr': corr,
+                    'acc_i': ri['accuracy'], 'acc_j': rj['accuracy'],
+                    'pair_acc': pair_acc,
+                    'acc_gain': pair_acc - max(ri['accuracy'], rj['accuracy']),
+                })
+
+    # Sort by pair accuracy (we want the best ensemble, not just lowest correlation)
+    all_pairs.sort(key=lambda x: x['pair_acc'], reverse=True)
+
+    print(f"\n  Top 10 pairs by ensemble accuracy:")
+    print(f"  {'Pair':<45} {'Corr':>6} {'Ind A':>6} {'Ind B':>6} {'Pair':>6} {'Gain':>6}")
+    print(f"  {'-'*80}")
+    for p in all_pairs[:10]:
+        print(f"  {p['key_i']} + {p['key_j']:<20} "
+              f"{p['corr']:>6.3f} {p['acc_i']*100:>5.1f}% {p['acc_j']*100:>5.1f}% "
+              f"{p['pair_acc']*100:>5.1f}% {p['acc_gain']*100:>+5.2f}%")
+
+    # Most diverse pairs
+    all_pairs_by_div = sorted(all_pairs, key=lambda x: x['corr'])
+    print(f"\n  Top 5 pairs by diversity (lowest correlation):")
+    print(f"  {'Pair':<45} {'Corr':>6} {'Ind A':>6} {'Ind B':>6} {'Pair':>6}")
+    print(f"  {'-'*75}")
+    for p in all_pairs_by_div[:5]:
+        print(f"  {p['key_i']} + {p['key_j']:<20} "
+              f"{p['corr']:>6.3f} {p['acc_i']*100:>5.1f}% {p['acc_j']*100:>5.1f}% "
+              f"{p['pair_acc']*100:>5.1f}%")
+
+    # ============================================================
+    # [6] TEMPERATURE SWEEP ON BEST PAIRS
+    # ============================================================
+    print(f"\n{'='*65}")
+    print("TEMPERATURE SWEEP — SOFT VOTING")
+    print(f"{'='*65}")
+
+    # Test on top-3 accuracy pairs AND top-3 diversity pairs
+    test_pairs = []
+    seen = set()
+    for p in all_pairs[:3]:
+        pair_key = tuple(sorted([p['key_i'], p['key_j']]))
+        if pair_key not in seen:
+            test_pairs.append(p)
+            seen.add(pair_key)
+    for p in all_pairs_by_div[:3]:
+        pair_key = tuple(sorted([p['key_i'], p['key_j']]))
+        if pair_key not in seen:
+            test_pairs.append(p)
+            seen.add(pair_key)
+
+    targets = all_results[all_keys[0]]['targets']
+
+    for p in test_pairs:
+        ki, kj = p['key_i'], p['key_j']
+        ri, rj = all_results[ki], all_results[kj]
+        print(f"\n  Pair: {ki} + {kj}")
+        print(f"  Individual: {ri['accuracy']*100:.1f}% / {rj['accuracy']*100:.1f}% | "
+              f"Correlation: {p['corr']:.3f}")
+        print(f"  {'Temp':>6} | {'Accuracy':>8} | {'Emergence':>9} | {'Emrg %':>7} | Details")
+        print(f"  {'-'*60}")
+
+        for temp in config['temperatures']:
+            sv = soft_vote_with_temperature([ri, rj], targets, temperature=temp)
+            detail = ""
+            if sv['emergence_count'] > 0:
+                # Show which classes
+                active_classes = {c: n for c, n in sv['per_class_emergence'].items() if n > 0}
+                class_str = ", ".join(f"{CLASS_NAMES[c]}:{n}" for c, n in active_classes.items())
+                detail = f" [{class_str}]"
+            print(f"  {temp:>6.2f} | {sv['accuracy']*100:>7.1f}% | "
+                  f"{sv['emergence_count']:>9d} | {sv['emergence_rate']*100:>6.2f}% |{detail}")
+
+    # ============================================================
+    # [7] BEST ENSEMBLE OF 3-5 FROM ALL ARCHITECTURES
+    # ============================================================
+    print(f"\n{'='*65}")
+    print("BEST ENSEMBLES (N=3 to N=5)")
+    print(f"{'='*65}")
+
+    # Find best N=3, N=4, N=5 ensembles by trying top individuals
+    top_keys = sorted(all_keys, key=lambda k: all_results[k]['accuracy'], reverse=True)[:10]
+
+    for n_ens in [3, 4, 5]:
+        best_ens_acc = 0
+        best_ens_combo = None
+        best_ens_emergence = 0
+
+        for combo in combinations(top_keys, n_ens):
+            combo_results = [all_results[k] for k in combo]
+            mean_probs = torch.stack([r['probs'] for r in combo_results]).mean(dim=0)
+            ens_pred = mean_probs.argmax(dim=1)
+            ens_acc = ens_pred.eq(targets).float().mean().item()
+
+            if ens_acc > best_ens_acc:
+                best_ens_acc = ens_acc
+                best_ens_combo = combo
+
+        if best_ens_combo:
+            combo_results = [all_results[k] for k in best_ens_combo]
+            sv = soft_vote_with_temperature(combo_results, targets, temperature=1.0)
+            corr = pairwise_error_correlation(combo_results)
+
+            print(f"\n  Best N={n_ens}: {best_ens_acc*100:.1f}% accuracy | "
+                  f"Corr: {corr:.3f} | Emergence: {sv['emergence_count']}")
+            for k in best_ens_combo:
+                print(f"    • {k}: {all_results[k]['accuracy']*100:.1f}%")
+
+            # Temperature sweep on best ensemble
+            if n_ens <= 4:
+                print(f"    Temperature sweep:")
+                for temp in [0.5, 1.0, 2.0, 3.0, 5.0]:
+                    sv_t = soft_vote_with_temperature(combo_results, targets, temperature=temp)
+                    print(f"      T={temp:.1f}: {sv_t['accuracy']*100:.1f}% | "
+                          f"Emergence: {sv_t['emergence_count']}")
+
+    # ============================================================
+    # [8] SUMMARY
+    # ============================================================
+    print(f"\n{'='*65}")
+    print("SUMMARY")
+    print(f"{'='*65}")
+
+    print(f"""
+  ACCURACY CEILING:
+    Best single SNN:        {best_overall_key} → {best_overall_acc*100:.1f}%
+    Best pair (soft vote):   {all_pairs[0]['key_i']} + {all_pairs[0]['key_j']} → {all_pairs[0]['pair_acc']*100:.1f}%
+
+  DIVERSITY RANKING (most to least diverse errors):
+    {', '.join(f'{p}: {c:.3f}' for p, c in ranked)}
+
+  KEY FINDING: {most_diverse_param} variation produces the most diverse errors
+  → This is the '1% difference' that matters most for SNN ensembles
+    """)
+
+
+if __name__ == '__main__':
+    run_experiment()
