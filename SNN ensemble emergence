@@ -1,0 +1,974 @@
+"""
+SNN Ensemble Emergence Experiment
+=================================
+Tests whether intrinsic diversity in spiking neural networks produces
+emergent collective capabilities that no individual network possesses.
+
+Designed for Google Colab (GPU runtime).
+Based on Sergiy's SNN-ANN hybrid triage research.
+
+Key questions:
+1. At what N do emergent outputs appear (ensemble right, all individuals wrong)?
+2. How does error decorrelation scale with N?
+3. Can disagreement patterns detect out-of-distribution inputs?
+4. At what N does cost exceed single ANN?
+
+Run: Open in Colab, set runtime to GPU, run all cells.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import numpy as np
+from collections import Counter
+import time
+import json
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+CONFIG = {
+    # Architecture
+    'input_size': 784,       # Fashion-MNIST 28x28
+    'hidden_size': 256,      # LIF neurons in hidden layer (up from 128 — more room for diverse representations)
+    'output_size': 10,       # digit classes
+    'num_steps': 25,         # SNN simulation timesteps
+
+    # Training
+    'batch_size': 256,
+    'epochs': 20,
+    'lr': 1e-3,
+
+    # Ensemble
+    'ensemble_sizes': [2, 3, 5, 7, 10],  # N values to test
+    'max_ensemble': 10,       # train this many diverse SNNs
+
+    # Diversity injection
+    'synaptic_noise_std': 0.4,    # Gaussian noise on membrane potential during training
+                                   # (threshold=1.0, so 0.4 = 40% perturbation — aggressive,
+                                   #  will reduce individual accuracy but increase diversity)
+    'dropout_rate': 0.1,          # stochastic neuron silencing
+
+    # ANN baseline
+    'ann_hidden': 512,
+
+    # Device
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+}
+
+print(f"Device: {CONFIG['device']}")
+
+# ============================================================
+# SURROGATE GRADIENT
+# ============================================================
+
+class SurrogateSpike(torch.autograd.Function):
+    """Straight-through estimator with sigmoid surrogate gradient."""
+    scale = 25.0
+
+    @staticmethod
+    def forward(ctx, membrane):
+        spikes = (membrane > 0).float()
+        ctx.save_for_backward(membrane)
+        return spikes
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        membrane, = ctx.saved_tensors
+        sigmoid = torch.sigmoid(SurrogateSpike.scale * membrane)
+        return grad_output * sigmoid * (1 - sigmoid) * SurrogateSpike.scale
+
+spike_fn = SurrogateSpike.apply
+
+# ============================================================
+# SNN MODEL (LIF neurons with batch norm)
+# ============================================================
+
+class DiverseSNN(nn.Module):
+    """
+    Leaky Integrate-and-Fire SNN with noise injection for
+    developmental stochasticity.
+
+    Diversity sources (between networks):
+      1. Different random weight initialisation (via different seeds)
+      2. Transient membrane noise during training — different noise at
+         each timestep perturbs which neurons fire, altering gradient
+         signals and shaping each network's learning trajectory differently
+      3. Stochastic neuron silencing (dropout on spikes)
+
+    The noise is TRANSIENT (per-timestep, not accumulated) so weights
+    stay clean for gradient descent. Diversity emerges because different
+    noise histories during training produce different learned representations.
+    """
+    def __init__(self, config, noise_std=0.0, dropout_rate=0.0):
+        super().__init__()
+        self.config = config
+        self.noise_std = noise_std
+        self.dropout_rate = dropout_rate
+        self.num_steps = config['num_steps']
+
+        # Layers
+        self.fc1 = nn.Linear(config['input_size'], config['hidden_size'])
+        self.bn1 = nn.BatchNorm1d(config['hidden_size'])
+        self.fc2 = nn.Linear(config['hidden_size'], config['output_size'])
+
+        # LIF parameters (learnable)
+        self.beta = nn.Parameter(torch.ones(config['hidden_size']) * 0.9)
+        self.threshold = 1.0
+
+        # Dropout for stochastic silencing
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        device = x.device
+
+        # Flatten
+        x = x.view(batch_size, -1)
+
+        # Encode as constant current over timesteps
+        input_current = self.fc1(x)
+        input_current = self.bn1(input_current)
+
+        # LIF dynamics
+        membrane = torch.zeros(batch_size, self.config['hidden_size'], device=device)
+        spike_sum = torch.zeros(batch_size, self.config['hidden_size'], device=device)
+        output_sum = torch.zeros(batch_size, self.config['output_size'], device=device)
+
+        beta = torch.sigmoid(self.beta)  # keep in [0, 1]
+
+        spikes_total = 0
+        active_total = 0
+
+        for t in range(self.num_steps):
+            # Leaky integration
+            membrane = beta * membrane + input_current
+
+            # Inject transient membrane noise during training
+            # (biological analogue: neural noise from thermal/quantum
+            #  fluctuations — different each timestep, not accumulated)
+            if self.training and self.noise_std > 0:
+                membrane_noise = torch.randn_like(membrane) * self.noise_std
+                membrane = membrane + membrane_noise
+
+            # Spike generation
+            spikes = spike_fn(membrane - self.threshold)
+
+            # Reset after spike
+            membrane = membrane * (1 - spikes)
+
+            # Apply stochastic silencing (neuron-level dropout)
+            if self.dropout is not None:
+                spikes = self.dropout(spikes)
+
+            spike_sum += spikes
+
+            # Track activation
+            spikes_total += spikes.sum().item()
+            active_total += spikes.numel()
+
+            # Accumulate output
+            output_sum += self.fc2(spikes)
+
+        # Average over timesteps
+        output = output_sum / self.num_steps
+        activation_rate = spikes_total / active_total if active_total > 0 else 0
+
+        return output, spike_sum, activation_rate
+
+# ============================================================
+# ANN BASELINE
+# ============================================================
+
+class BaselineANN(nn.Module):
+    """Standard feedforward ANN for comparison."""
+    def __init__(self, config):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(config['input_size'], config['ann_hidden']),
+            nn.BatchNorm1d(config['ann_hidden']),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(config['ann_hidden'], config['ann_hidden']),
+            nn.BatchNorm1d(config['ann_hidden']),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(config['ann_hidden'], config['output_size'])
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+# ============================================================
+# DATA
+# ============================================================
+
+def load_data(config):
+    """Load full Fashion-MNIST train/test and MNIST as OOD."""
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.2860,), (0.3530,))  # Fashion-MNIST stats
+    ])
+
+    # PRIMARY TASK: Fashion-MNIST (harder — ~85-88% SNN accuracy expected)
+    train_data = datasets.FashionMNIST('./data', train=True, download=True, transform=transform)
+    test_data = datasets.FashionMNIST('./data', train=False, download=True, transform=transform)
+
+    train_loader = DataLoader(train_data, batch_size=config['batch_size'],
+                              shuffle=True, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_data, batch_size=config['batch_size'],
+                             shuffle=False, num_workers=2, pin_memory=True)
+
+    # OOD: MNIST digits (same dimensions, different distribution)
+    ood_data = datasets.MNIST('./data', train=False, download=True, transform=transform)
+    ood_loader = DataLoader(ood_data, batch_size=config['batch_size'],
+                            shuffle=False, num_workers=2, pin_memory=True)
+
+    return train_loader, test_loader, ood_loader
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+def train_snn(model, train_loader, config, snn_id=0):
+    """Train a single SNN."""
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, config['epochs'])
+    criterion = nn.CrossEntropyLoss()
+    device = config['device']
+    model = model.to(device)
+
+    print(f"\n  SNN-{snn_id}: Training...")
+    for epoch in range(config['epochs']):
+        model.train()
+        total_loss = 0
+        correct = 0
+        total = 0
+
+        for data, target in train_loader:
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+
+            output, _, _ = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+
+            # Gradient clipping for SNN stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            _, predicted = output.max(1)
+            correct += predicted.eq(target).sum().item()
+            total += target.size(0)
+
+        scheduler.step()
+        acc = 100. * correct / total
+
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"    Epoch {epoch+1}/{config['epochs']}: "
+                  f"Loss={total_loss/len(train_loader):.4f}, Acc={acc:.1f}%")
+
+    return model
+
+
+def train_ann(model, train_loader, config):
+    """Train the ANN baseline."""
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, config['epochs'])
+    criterion = nn.CrossEntropyLoss()
+    device = config['device']
+    model = model.to(device)
+
+    print("\n  ANN: Training...")
+    for epoch in range(config['epochs']):
+        model.train()
+        correct = 0
+        total = 0
+
+        for data, target in train_loader:
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
+
+            _, predicted = output.max(1)
+            correct += predicted.eq(target).sum().item()
+            total += target.size(0)
+
+        scheduler.step()
+
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            acc = 100. * correct / total
+            print(f"    Epoch {epoch+1}/{config['epochs']}: Acc={acc:.1f}%")
+
+    return model
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
+def evaluate_single(model, test_loader, config, is_snn=True):
+    """Evaluate a single model. Returns predictions, confidences, full probs, correctness."""
+    device = config['device']
+    model.eval()
+    model = model.to(device)
+
+    all_preds = []
+    all_confs = []
+    all_probs = []
+    all_targets = []
+    all_correct = []
+    total_activation = 0
+    n_batches = 0
+
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+
+            if is_snn:
+                output, _, act_rate = model(data)
+                total_activation += act_rate
+                n_batches += 1
+            else:
+                output = model(data)
+
+            probs = F.softmax(output, dim=1)
+            conf, pred = probs.max(dim=1)
+
+            all_preds.append(pred.cpu())
+            all_confs.append(conf.cpu())
+            all_probs.append(probs.cpu())
+            all_targets.append(target.cpu())
+            all_correct.append(pred.eq(target).cpu())
+
+    results = {
+        'preds': torch.cat(all_preds),
+        'confs': torch.cat(all_confs),
+        'probs': torch.cat(all_probs),       # [n_samples, n_classes]
+        'targets': torch.cat(all_targets),
+        'correct': torch.cat(all_correct),
+        'accuracy': torch.cat(all_correct).float().mean().item(),
+    }
+
+    if is_snn:
+        results['activation_rate'] = total_activation / n_batches
+
+    return results
+
+# ============================================================
+# ENSEMBLE ANALYSIS
+# ============================================================
+
+def analyse_ensemble(snn_results_list, targets, ensemble_size=None):
+    """
+    Analyse ensemble of diverse SNNs using both hard and soft voting.
+
+    Hard vote: confidence-weighted plurality (each network's top-1 prediction).
+    Soft vote: average full probability distributions, then argmax.
+
+    Emergence is measured on SOFT vote — the mechanism by which second-choice
+    agreement across networks can produce correct answers that no individual gives.
+    """
+    if ensemble_size is None:
+        ensemble_size = len(snn_results_list)
+
+    results = snn_results_list[:ensemble_size]
+    n_samples = len(targets)
+    n_models = len(results)
+
+    # Stack all predictions: shape [n_models, n_samples]
+    all_preds = torch.stack([r['preds'] for r in results])
+    all_confs = torch.stack([r['confs'] for r in results])
+    all_correct = torch.stack([r['correct'] for r in results])
+
+    # Stack full probability distributions: shape [n_models, n_samples, n_classes]
+    all_probs = torch.stack([r['probs'] for r in results])
+
+    # ===========================================
+    # HARD VOTE (confidence-weighted plurality)
+    # ===========================================
+    hard_preds = []
+    for i in range(n_samples):
+        vote_weights = {}
+        for m in range(n_models):
+            pred = int(all_preds[m, i])
+            conf = float(all_confs[m, i])
+            vote_weights[pred] = vote_weights.get(pred, 0) + conf
+        hard_preds.append(max(vote_weights, key=vote_weights.get))
+
+    hard_preds = torch.tensor(hard_preds)
+    hard_correct = hard_preds.eq(targets)
+    hard_accuracy = hard_correct.float().mean().item()
+
+    # ===========================================
+    # SOFT VOTE (average probability distributions)
+    # ===========================================
+    # Average across models: [n_samples, n_classes]
+    mean_probs = all_probs.mean(dim=0)
+    soft_preds = mean_probs.argmax(dim=1)
+    soft_correct = soft_preds.eq(targets)
+    soft_accuracy = soft_correct.float().mean().item()
+
+    # ===========================================
+    # EMERGENCE (on soft vote — where it can actually occur)
+    # ===========================================
+    # All individuals wrong, but soft ensemble right
+    all_individual_wrong = (all_correct.sum(dim=0) == 0)
+    soft_emergence_mask = all_individual_wrong & soft_correct
+    soft_emergence_count = soft_emergence_mask.sum().item()
+    soft_emergence_rate = soft_emergence_count / n_samples
+
+    # Also track hard emergence for comparison (should still be ~0)
+    hard_emergence_mask = all_individual_wrong & hard_correct
+    hard_emergence_count = hard_emergence_mask.sum().item()
+
+    # ===========================================
+    # SOFT VOTE MECHANICS — why did emergence happen?
+    # ===========================================
+    # For emergence cases, analyse the probability distributions
+    emergence_details = []
+    if soft_emergence_count > 0:
+        emergence_indices = torch.where(soft_emergence_mask)[0][:20]  # first 20
+        for idx in emergence_indices:
+            idx_val = idx.item()
+            true_label = targets[idx_val].item()
+            soft_pred = soft_preds[idx_val].item()
+            mean_prob_correct = float(mean_probs[idx_val, true_label])
+
+            # What rank was the true class for each individual?
+            ranks = []
+            individual_probs_for_true = []
+            for m in range(n_models):
+                prob_vec = all_probs[m, idx_val]
+                rank = (prob_vec > prob_vec[true_label]).sum().item() + 1
+                ranks.append(rank)
+                individual_probs_for_true.append(float(prob_vec[true_label]))
+
+            emergence_details.append({
+                'idx': idx_val,
+                'true_label': true_label,
+                'soft_pred': soft_pred,
+                'mean_prob_correct': mean_prob_correct,
+                'individual_ranks': ranks,
+                'individual_probs': individual_probs_for_true,
+                'individual_preds': [int(all_preds[m, idx_val]) for m in range(n_models)],
+            })
+
+    # ===========================================
+    # ERROR DECORRELATION
+    # ===========================================
+    error_correlations = []
+    for i in range(n_models):
+        for j in range(i + 1, n_models):
+            errors_i = (~all_correct[i]).float()
+            errors_j = (~all_correct[j]).float()
+            if errors_i.std() > 0 and errors_j.std() > 0:
+                corr = torch.corrcoef(torch.stack([errors_i, errors_j]))[0, 1].item()
+                error_correlations.append(corr)
+
+    mean_error_corr = np.mean(error_correlations) if error_correlations else 0
+
+    # ===========================================
+    # DISAGREEMENT PATTERNS
+    # ===========================================
+    agreement_patterns = []
+    unanimous_correct = 0
+    unanimous_wrong = 0
+    split_vote = 0
+
+    for i in range(n_samples):
+        preds_i = all_preds[:, i].tolist()
+        unique_preds = len(set(preds_i))
+
+        if unique_preds == 1:
+            if all_correct[0, i]:
+                unanimous_correct += 1
+            else:
+                unanimous_wrong += 1
+        else:
+            split_vote += 1
+
+        agreement_patterns.append(unique_preds)
+
+    # ===========================================
+    # PER-CLASS EMERGENCE
+    # ===========================================
+    per_class_emergence = {}
+    for c in range(10):
+        class_mask = (targets == c)
+        if class_mask.sum() > 0:
+            class_emergence = (soft_emergence_mask & class_mask).sum().item()
+            per_class_emergence[c] = class_emergence
+
+    return {
+        # Soft vote (primary)
+        'ensemble_accuracy': soft_accuracy,
+        'soft_accuracy': soft_accuracy,
+        'soft_preds': soft_preds,
+        'soft_correct': soft_correct,
+        'emergence_count': soft_emergence_count,
+        'emergence_rate': soft_emergence_rate,
+        'emergence_details': emergence_details,
+        # Hard vote (comparison)
+        'hard_accuracy': hard_accuracy,
+        'hard_emergence_count': hard_emergence_count,
+        # Individual
+        'individual_accuracies': [r['accuracy'] for r in results],
+        'mean_individual_accuracy': np.mean([r['accuracy'] for r in results]),
+        'best_individual_accuracy': max([r['accuracy'] for r in results]),
+        # Diversity metrics
+        'mean_error_correlation': mean_error_corr,
+        'unanimous_correct': unanimous_correct / n_samples,
+        'unanimous_wrong': unanimous_wrong / n_samples,
+        'split_vote': split_vote / n_samples,
+        'per_class_emergence': per_class_emergence,
+        'n_models': n_models,
+        'ensemble_preds': soft_preds,
+        'ensemble_correct': soft_correct,
+        'agreement_diversity': np.mean(agreement_patterns),
+    }
+
+
+def analyse_ood_detection(snn_results_list, ood_results_list, ensemble_size=None):
+    """
+    Test whether disagreement among diverse SNNs detects
+    out-of-distribution inputs (Fashion-MNIST vs MNIST).
+    """
+    if ensemble_size is None:
+        ensemble_size = len(snn_results_list)
+
+    in_dist = snn_results_list[:ensemble_size]
+    ood = ood_results_list[:ensemble_size]
+
+    def disagreement_score(results_list):
+        """Fraction of models that disagree with majority for each input."""
+        n_samples = len(results_list[0]['preds'])
+        scores = []
+        for i in range(n_samples):
+            preds = [int(r['preds'][i]) for r in results_list]
+            majority = Counter(preds).most_common(1)[0][1]
+            disagreement = 1.0 - (majority / len(preds))
+            scores.append(disagreement)
+        return torch.tensor(scores)
+
+    def confidence_score(results_list):
+        """Mean confidence across ensemble for each input."""
+        confs = torch.stack([r['confs'] for r in results_list])
+        return confs.mean(dim=0)
+
+    in_disagreement = disagreement_score(in_dist)
+    ood_disagreement = disagreement_score(ood)
+
+    in_confidence = confidence_score(in_dist)
+    ood_confidence = confidence_score(ood)
+
+    # Can we separate in-distribution from OOD using disagreement?
+    # Simple threshold: what fraction of OOD has higher disagreement than median in-dist?
+    threshold = in_disagreement.median().item()
+    ood_detected = (ood_disagreement > threshold).float().mean().item()
+    in_false_alarm = (in_disagreement > threshold).float().mean().item()
+
+    return {
+        'in_dist_mean_disagreement': in_disagreement.mean().item(),
+        'ood_mean_disagreement': ood_disagreement.mean().item(),
+        'in_dist_mean_confidence': in_confidence.mean().item(),
+        'ood_mean_confidence': ood_confidence.mean().item(),
+        'ood_detection_rate': ood_detected,
+        'in_dist_false_alarm_rate': in_false_alarm,
+        'separation': ood_disagreement.mean().item() - in_disagreement.mean().item(),
+    }
+
+# ============================================================
+# COST ANALYSIS
+# ============================================================
+
+def cost_analysis(snn_results_list, ann_result, ensemble_analysis_results, config):
+    """
+    Compare cost of ensemble + ANN escalation vs ANN alone.
+    SNN cost = activation_rate (fraction of neurons active).
+    ANN cost = 1.0 (all neurons active).
+    """
+    results = {}
+    snn_cost_per_unit = np.mean([r.get('activation_rate', 0.28) for r in snn_results_list])
+
+    for n in config['ensemble_sizes']:
+        if n > len(snn_results_list):
+            continue
+
+        ens = ensemble_analysis_results.get(n, {})
+        split_rate = ens.get('split_vote', 0.5)
+
+        # Cost: N SNNs (parallel) + ANN on splits
+        ensemble_cost = n * snn_cost_per_unit + split_rate * 1.0
+        ann_only_cost = 1.0
+
+        results[n] = {
+            'ensemble_cost': ensemble_cost,
+            'ann_only_cost': ann_only_cost,
+            'cost_ratio': ensemble_cost / ann_only_cost,
+            'ensemble_accuracy': ens.get('ensemble_accuracy', 0),
+            'ann_accuracy': ann_result['accuracy'],
+            'snn_cost_per_unit': snn_cost_per_unit,
+            'split_rate': split_rate,
+        }
+
+    return results
+
+# ============================================================
+# MAIN EXPERIMENT
+# ============================================================
+
+def run_experiment():
+    """Run the full ensemble emergence experiment."""
+    config = CONFIG
+    print("=" * 60)
+    print("SNN ENSEMBLE EMERGENCE EXPERIMENT")
+    print("=" * 60)
+    print(f"\nConfig: {json.dumps({k: v for k, v in config.items() if k != 'device'}, indent=2)}")
+
+    # Load data
+    print("\n[1/7] Loading data...")
+    train_loader, test_loader, ood_loader = load_data(config)
+    print(f"  Train: 60,000 (full Fashion-MNIST), Test: 10,000, OOD: 10,000 (MNIST digits)")
+
+    # Train diverse SNNs (WITH noise)
+    print(f"\n[2/7] Training {config['max_ensemble']} NOISY SNNs (noise_std={config['synaptic_noise_std']})...")
+    snn_models = []
+    for i in range(config['max_ensemble']):
+        torch.manual_seed(42 + i * 1000)
+        np.random.seed(42 + i * 1000)
+
+        model = DiverseSNN(
+            config,
+            noise_std=config['synaptic_noise_std'],
+            dropout_rate=config['dropout_rate']
+        )
+        model = train_snn(model, train_loader, config, snn_id=i)
+        snn_models.append(model)
+
+    # Train control SNNs (dropout but NO noise — isolates membrane noise effect)
+    n_control = config['max_ensemble']  # match noisy count for full N comparison
+    print(f"\n[3/7] Training {n_control} CONTROL SNNs (dropout=0.1, noise_std=0, same seeds)...")
+    control_models = []
+    for i in range(n_control):
+        torch.manual_seed(42 + i * 1000)  # SAME seeds as noisy SNNs
+        np.random.seed(42 + i * 1000)
+
+        model = DiverseSNN(
+            config,
+            noise_std=0.0,                    # NO membrane noise
+            dropout_rate=config['dropout_rate'] # SAME dropout as noisy (0.1)
+        )
+        model = train_snn(model, train_loader, config, snn_id=f"ctrl-{i}")
+        control_models.append(model)
+
+    # Train ANN baseline
+    print(f"\n[4/7] Training ANN baseline...")
+    torch.manual_seed(42)
+    ann_model = BaselineANN(config)
+    ann_model = train_ann(ann_model, train_loader, config)
+
+    # Evaluate all models
+    print(f"\n[5/7] Evaluating...")
+
+    # Noisy SNNs on test data
+    snn_results = []
+    for i, model in enumerate(snn_models):
+        result = evaluate_single(model, test_loader, config, is_snn=True)
+        snn_results.append(result)
+        print(f"  SNN-{i} (noisy):  Accuracy={result['accuracy']*100:.1f}%, "
+              f"Activation={result['activation_rate']:.3f}")
+
+    # Control SNNs on test data
+    control_results = []
+    for i, model in enumerate(control_models):
+        result = evaluate_single(model, test_loader, config, is_snn=True)
+        control_results.append(result)
+        print(f"  SNN-ctrl-{i}:     Accuracy={result['accuracy']*100:.1f}%, "
+              f"Activation={result['activation_rate']:.3f}")
+
+    # SNNs on OOD data
+    ood_results = []
+    for i, model in enumerate(snn_models):
+        result = evaluate_single(model, ood_loader, config, is_snn=True)
+        ood_results.append(result)
+
+    # Control on OOD data
+    control_ood_results = []
+    for i, model in enumerate(control_models):
+        result = evaluate_single(model, ood_loader, config, is_snn=True)
+        control_ood_results.append(result)
+
+    # ANN on test data
+    ann_result = evaluate_single(ann_model, test_loader, config, is_snn=False)
+    print(f"  ANN:              Accuracy={ann_result['accuracy']*100:.1f}%")
+
+    # ============================================================
+    # CONTROL vs NOISY COMPARISON (across all N values)
+    # ============================================================
+    print(f"\n[6/7] Control vs Noisy comparison...")
+    targets = snn_results[0]['targets']
+
+    print(f"\n{'='*60}")
+    print("CONTROL vs NOISY — Error Correlation by N")
+    print(f"{'='*60}")
+    print(f"  {'N':>3} | {'Control':>10} | {'Noisy':>10} | {'Delta':>10} | {'Gap widens?':>12}")
+    print(f"  {'-'*55}")
+
+    prev_delta = None
+    for n in config['ensemble_sizes']:
+        if n > len(control_results) or n > len(snn_results):
+            continue
+        ctrl = analyse_ensemble(control_results, targets, ensemble_size=n)
+        noisy = analyse_ensemble(snn_results, targets, ensemble_size=n)
+        delta = noisy['mean_error_correlation'] - ctrl['mean_error_correlation']
+        widens = ""
+        if prev_delta is not None:
+            widens = "yes" if delta < prev_delta else "no"
+        prev_delta = delta
+        print(f"  {n:>3} | {ctrl['mean_error_correlation']:>10.4f} | "
+              f"{noisy['mean_error_correlation']:>10.4f} | {delta:>+10.4f} | {widens:>12}")
+
+    # Detailed comparison at N=10 (full ensemble)
+    n_full = min(config['max_ensemble'], len(control_results), len(snn_results))
+    control_ens = analyse_ensemble(control_results, targets, ensemble_size=n_full)
+    noisy_ens = analyse_ensemble(snn_results, targets, ensemble_size=n_full)
+
+    print(f"\n{'='*60}")
+    print(f"CONTROL vs NOISY — Detail at N={n_full}")
+    print(f"{'='*60}")
+    print(f"  {'Metric':<30} {'Control':>10} {'Noisy':>10} {'Delta':>10}")
+    print(f"  {'-'*60}")
+    print(f"  {'Mean individual accuracy':<30} "
+          f"{control_ens['mean_individual_accuracy']*100:>9.1f}% "
+          f"{noisy_ens['mean_individual_accuracy']*100:>9.1f}% "
+          f"{(noisy_ens['mean_individual_accuracy']-control_ens['mean_individual_accuracy'])*100:>+9.1f}%")
+    print(f"  {'Ensemble accuracy':<30} "
+          f"{control_ens['ensemble_accuracy']*100:>9.1f}% "
+          f"{noisy_ens['ensemble_accuracy']*100:>9.1f}% "
+          f"{(noisy_ens['ensemble_accuracy']-control_ens['ensemble_accuracy'])*100:>+9.1f}%")
+    print(f"  {'Error correlation':<30} "
+          f"{control_ens['mean_error_correlation']:>10.4f} "
+          f"{noisy_ens['mean_error_correlation']:>10.4f} "
+          f"{noisy_ens['mean_error_correlation']-control_ens['mean_error_correlation']:>+10.4f}")
+    print(f"  {'Emergence count':<30} "
+          f"{control_ens['emergence_count']:>10d} "
+          f"{noisy_ens['emergence_count']:>10d}")
+    print(f"  {'Split vote rate':<30} "
+          f"{control_ens['split_vote']*100:>9.1f}% "
+          f"{noisy_ens['split_vote']*100:>9.1f}%")
+
+    # Activation rates
+    ctrl_act = np.mean([r.get('activation_rate', 0) for r in control_results])
+    noisy_act = np.mean([r.get('activation_rate', 0) for r in snn_results])
+    print(f"  {'Mean activation rate':<30} "
+          f"{ctrl_act:>10.3f} "
+          f"{noisy_act:>10.3f} "
+          f"{noisy_act-ctrl_act:>+10.3f}")
+    print(f"  {'Cost per SNN (relative)':<30} "
+          f"{ctrl_act:>10.3f} "
+          f"{noisy_act:>10.3f}")
+
+    # OOD comparison
+    control_ood = analyse_ood_detection(control_results, control_ood_results, ensemble_size=n_full)
+    noisy_ood = analyse_ood_detection(snn_results, ood_results, ensemble_size=n_full)
+
+    print(f"\n  {'OOD detection rate':<30} "
+          f"{control_ood['ood_detection_rate']*100:>9.1f}% "
+          f"{noisy_ood['ood_detection_rate']*100:>9.1f}%")
+    print(f"  {'OOD false alarm rate':<30} "
+          f"{control_ood['in_dist_false_alarm_rate']*100:>9.1f}% "
+          f"{noisy_ood['in_dist_false_alarm_rate']*100:>9.1f}%")
+
+    # BatchNorm suppression check
+    noisy_acc = noisy_ens['mean_individual_accuracy'] * 100
+    if noisy_acc > 94:
+        print(f"\n  ⚠ WARNING: Noisy SNN accuracy={noisy_acc:.1f}% (>94%). "
+              f"BatchNorm may be suppressing noise. Consider disabling BN or increasing noise.")
+    elif noisy_acc < 85:
+        print(f"\n  ⚠ WARNING: Noisy SNN accuracy={noisy_acc:.1f}% (<85%). "
+              f"Noise may be too aggressive. Consider reducing to 0.25.")
+    else:
+        print(f"\n  ✓ Noisy SNN accuracy={noisy_acc:.1f}% — in the sweet spot (85-94%).")
+
+    noise_helps = noisy_ens['mean_error_correlation'] < control_ens['mean_error_correlation']
+    print(f"\n  VERDICT: Noise {'INCREASES' if noise_helps else 'DOES NOT INCREASE'} diversity "
+          f"beyond random initialisation alone")
+    if noise_helps:
+        improvement = control_ens['mean_error_correlation'] - noisy_ens['mean_error_correlation']
+        print(f"  Error correlation reduced by {improvement:.4f} "
+              f"({improvement/control_ens['mean_error_correlation']*100:.1f}% relative)")
+
+    # ============================================================
+    # FULL ENSEMBLE ANALYSIS (noisy SNNs)
+    # ============================================================
+    print(f"\n[7/7] Full ensemble analysis (noisy SNNs)...")
+
+    ensemble_results = {}
+    ood_detection_results = {}
+
+    print(f"\n{'='*70}")
+    print(f"{'N':>3} | {'Soft Acc':>8} | {'Hard Acc':>8} | {'Best Ind':>8} | "
+          f"{'Emerge':>7} | {'Err Corr':>8} | {'Split':>7}")
+    print(f"{'-'*70}")
+
+    for n in config['ensemble_sizes']:
+        if n > len(snn_results):
+            continue
+
+        ens = analyse_ensemble(snn_results, targets, ensemble_size=n)
+        ensemble_results[n] = ens
+
+        ood_det = analyse_ood_detection(snn_results, ood_results, ensemble_size=n)
+        ood_detection_results[n] = ood_det
+
+        print(f"{n:>3} | {ens['soft_accuracy']*100:>7.1f}% | "
+              f"{ens['hard_accuracy']*100:>7.1f}% | "
+              f"{ens['best_individual_accuracy']*100:>7.1f}% | "
+              f"{ens['emergence_count']:>7d} | "
+              f"{ens['mean_error_correlation']:>8.3f} | "
+              f"{ens['split_vote']*100:>6.1f}%")
+
+    # Cost analysis
+    print(f"\n{'='*60}")
+    print("COST ANALYSIS (relative to single ANN = 1.0)")
+    print(f"{'='*60}")
+    costs = cost_analysis(snn_results, ann_result, ensemble_results, config)
+    for n, c in costs.items():
+        print(f"  N={n:>2}: Cost={c['cost_ratio']:.2f}x | "
+              f"Ens Acc={c['ensemble_accuracy']*100:.1f}% vs ANN={c['ann_accuracy']*100:.1f}%")
+
+    # OOD detection results
+    print(f"\n{'='*60}")
+    print("OOD DETECTION (Fashion-MNIST vs MNIST digits)")
+    print(f"{'='*60}")
+    for n, ood in ood_detection_results.items():
+        print(f"  N={n:>2}: In-dist disagreement={ood['in_dist_mean_disagreement']:.3f}, "
+              f"OOD disagreement={ood['ood_mean_disagreement']:.3f}, "
+              f"Detection={ood['ood_detection_rate']*100:.1f}%, "
+              f"False alarm={ood['in_dist_false_alarm_rate']*100:.1f}%")
+
+    # Emergence details
+    print(f"\n{'='*60}")
+    print("EMERGENCE ANALYSIS — SOFT VOTE")
+    print("(ensemble right via averaged probabilities, ALL individuals wrong)")
+    print(f"{'='*60}")
+    for n in config['ensemble_sizes']:
+        if n not in ensemble_results:
+            continue
+        ens = ensemble_results[n]
+        print(f"\n  N={n}: {ens['emergence_count']} soft emergence "
+              f"({ens['emergence_rate']*100:.2f}% of test set) | "
+              f"{ens['hard_emergence_count']} hard emergence")
+        if ens['emergence_count'] > 0:
+            print(f"    Per-class: {ens['per_class_emergence']}")
+
+    # Show emergence examples for best N
+    best_n = max(ensemble_results.keys(),
+                 key=lambda n: (ensemble_results[n]['emergence_count'],
+                                ensemble_results[n]['ensemble_accuracy']))
+    best_ens = ensemble_results[best_n]
+
+    if best_ens['emergence_count'] > 0 and best_ens['emergence_details']:
+        print(f"\n  EMERGENCE EXAMPLES (N={best_n}, first 10):")
+        print(f"  {'Idx':>5} | {'True':>4} | {'Soft':>4} | {'Avg P(true)':>10} | "
+              f"{'Ranks':>30} | {'Individual preds'}")
+        print(f"  {'-'*90}")
+        for d in best_ens['emergence_details'][:10]:
+            ranks_str = str(d['individual_ranks'][:best_n])
+            preds_str = str(d['individual_preds'][:best_n])
+            print(f"  {d['idx']:>5} | {d['true_label']:>4} | {d['soft_pred']:>4} | "
+                  f"{d['mean_prob_correct']:>10.4f} | "
+                  f"{ranks_str:>30} | {preds_str}")
+
+        # Summary stats on emergence cases
+        all_ranks = [r for d in best_ens['emergence_details']
+                     for r in d['individual_ranks'][:best_n]]
+        all_probs = [p for d in best_ens['emergence_details']
+                     for p in d['individual_probs'][:best_n]]
+        print(f"\n  Emergence pattern summary:")
+        print(f"    Mean rank of true class across individuals: {np.mean(all_ranks):.1f}")
+        print(f"    Mean P(true class) across individuals: {np.mean(all_probs):.4f}")
+        print(f"    → True class is typically the {int(np.mean(all_ranks))}th choice "
+              f"for individual networks")
+        print(f"    → But averaging {best_n} networks' ~{np.mean(all_probs):.1%} "
+              f"probability is enough to win")
+
+    # Error decorrelation analysis
+    print(f"\n{'='*60}")
+    print("ERROR DECORRELATION vs N")
+    print(f"{'='*60}")
+    for n in config['ensemble_sizes']:
+        if n not in ensemble_results:
+            continue
+        ens = ensemble_results[n]
+        print(f"  N={n:>2}: Mean error correlation = {ens['mean_error_correlation']:.4f}")
+
+    # Summary
+    print(f"\n{'='*60}")
+    print("SUMMARY")
+    print(f"{'='*60}")
+
+    any_emergence = any(ensemble_results[n]['emergence_count'] > 0
+                        for n in ensemble_results)
+
+    # Check if error correlation trends down with N
+    corr_values = [(n, ensemble_results[n]['mean_error_correlation'])
+                   for n in sorted(ensemble_results.keys())]
+    corr_trend = "decreases" if corr_values[-1][1] < corr_values[0][1] else "flat/increases"
+
+    # Best soft accuracy
+    best_soft_n = max(ensemble_results.keys(),
+                      key=lambda n: ensemble_results[n]['soft_accuracy'])
+    # Best emergence
+    best_emrg_n = max(ensemble_results.keys(),
+                      key=lambda n: (ensemble_results[n]['emergence_count'],
+                                     ensemble_results[n]['soft_accuracy']))
+    best_ens = ensemble_results[best_emrg_n]
+
+    print(f"""
+  ANN baseline accuracy:           {ann_result['accuracy']*100:.1f}%
+  Best individual SNN accuracy:    {max(r['accuracy'] for r in snn_results)*100:.1f}%
+  Best SOFT ensemble acc (N={best_soft_n}):  {ensemble_results[best_soft_n]['soft_accuracy']*100:.1f}%
+  Best HARD ensemble acc (N={best_soft_n}):  {ensemble_results[best_soft_n]['hard_accuracy']*100:.1f}%
+  Soft vs Hard accuracy gain:      {(ensemble_results[best_soft_n]['soft_accuracy']-ensemble_results[best_soft_n]['hard_accuracy'])*100:+.2f}%
+
+  Total emergence cases (N={best_emrg_n}):   {best_ens['emergence_count']} (soft) vs {best_ens['hard_emergence_count']} (hard)
+  Error correlation {corr_trend} with N ({corr_values[0][1]:.4f} at N={corr_values[0][0]} → {corr_values[-1][1]:.4f} at N={corr_values[-1][0]})
+
+  {'EMERGENCE DETECTED' if any_emergence else 'NO EMERGENCE DETECTED'} via soft voting
+  {'→ Second-choice agreement produces collective knowledge!' if any_emergence else '→ Second-choice agreement insufficient at this diversity level'}
+
+  Cost crossover: ensemble exceeds ANN cost at N ≈ {1.0 / np.mean([r.get('activation_rate', 0.28) for r in snn_results]):.1f}
+  (On neuromorphic hardware at ~1000x efficiency, crossover moves to N ≈ {1000.0 / np.mean([r.get('activation_rate', 0.28) for r in snn_results]):.0f})
+    """)
+
+    return {
+        'config': {k: v for k, v in config.items() if k != 'device'},
+        'snn_results': [{
+            'accuracy': r['accuracy'],
+            'activation_rate': r.get('activation_rate', 0)
+        } for r in snn_results],
+        'ann_accuracy': ann_result['accuracy'],
+        'ensemble_results': {
+            n: {k: v for k, v in ens.items()
+                if k not in ('ensemble_preds', 'ensemble_correct')}
+            for n, ens in ensemble_results.items()
+        },
+        'ood_detection': ood_detection_results,
+        'costs': costs,
+    }
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == '__main__':
+    results = run_experiment()
