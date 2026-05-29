@@ -1,0 +1,699 @@
+"""
+Convolutional SNN — Accuracy Ceiling + Diversity + Emergence
+=============================================================
+Removes the spatial handicap of flat SNNs. Convolutional feature
+extraction feeds into LIF spiking dynamics.
+
+Targets:
+  - Push single SNN accuracy from ~89% toward 95%+
+  - Test whether membrane noise regularisation transfers to conv-SNN
+  - Test diversity ensemble with temperature-scaled soft voting
+  - Measure emergence on the harder architecture
+
+Architecture:
+  Conv1(32, 3×3) → LIF → Pool
+  Conv2(64, 3×3) → LIF → Pool
+  Flatten → FC(hidden_size) → LIF → Output(10)
+
+All spiking layers use LIF neurons with membrane noise.
+
+Run: Google Colab, GPU runtime. ~30-40 minutes.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import numpy as np
+from itertools import combinations
+import json
+
+CONFIG = {
+    'input_channels': 1,
+    'output_size': 10,
+    'batch_size': 256,
+    'epochs': 30,
+    'lr': 1e-3,
+    'noise_std': 0.4,
+    'dropout_rate': 0.1,
+
+    # Conv architecture
+    'conv1_filters': 32,
+    'conv2_filters': 64,
+    'kernel_size': 3,
+    'hidden_size': 256,
+    'num_steps': 25,
+
+    # Ensemble
+    'n_diverse': 6,
+
+    # Temperature sweep
+    'temperatures': [0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0],
+
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu'
+}
+
+print(f"Device: {CONFIG['device']}")
+
+# ============================================================
+# SURROGATE GRADIENT
+# ============================================================
+
+class SurrogateSpike(torch.autograd.Function):
+    scale = 25.0
+    @staticmethod
+    def forward(ctx, membrane):
+        spikes = (membrane > 0).float()
+        ctx.save_for_backward(membrane)
+        return spikes
+    @staticmethod
+    def backward(ctx, grad_output):
+        membrane, = ctx.saved_tensors
+        sigmoid = torch.sigmoid(SurrogateSpike.scale * membrane)
+        return grad_output * sigmoid * (1 - sigmoid) * SurrogateSpike.scale
+
+spike_fn = SurrogateSpike.apply
+
+# ============================================================
+# CONVOLUTIONAL SNN
+# ============================================================
+
+class ConvSNN(nn.Module):
+    """
+    Spiking CNN: conv feature extraction with LIF dynamics at every layer.
+
+    Per timestep:
+      Input → Conv1 → BN → LIF → AvgPool
+            → Conv2 → BN → LIF → AvgPool
+            → Flatten → FC → BN → LIF → Output
+
+    Membrane noise injected at each LIF layer during training.
+    """
+    def __init__(self, config, noise_std=0.0, dropout_rate=0.0,
+                 num_steps=25, beta_init=0.9, hidden_size=256):
+        super().__init__()
+        self.num_steps = num_steps
+        self.noise_std = noise_std
+        self.hidden_size = hidden_size
+
+        c1 = config['conv1_filters']
+        c2 = config['conv2_filters']
+        ks = config['kernel_size']
+        pad = ks // 2
+
+        # Conv layers
+        self.conv1 = nn.Conv2d(config['input_channels'], c1, ks, padding=pad)
+        self.bn_conv1 = nn.BatchNorm2d(c1)
+        self.pool1 = nn.AvgPool2d(2)
+
+        self.conv2 = nn.Conv2d(c1, c2, ks, padding=pad)
+        self.bn_conv2 = nn.BatchNorm2d(c2)
+        self.pool2 = nn.AvgPool2d(2)
+
+        # After 2 pools on 28×28: 7×7 × c2
+        flat_size = c2 * 7 * 7
+
+        # FC + LIF layer
+        self.fc = nn.Linear(flat_size, hidden_size)
+        self.bn_fc = nn.BatchNorm1d(hidden_size)
+
+        # Output
+        self.fc_out = nn.Linear(hidden_size, config['output_size'])
+
+        # LIF parameters (learnable per layer)
+        self.beta_conv1 = nn.Parameter(torch.ones(c1, 1, 1) * beta_init)
+        self.beta_conv2 = nn.Parameter(torch.ones(c2, 1, 1) * beta_init)
+        self.beta_fc = nn.Parameter(torch.ones(hidden_size) * beta_init)
+
+        self.threshold = 1.0
+        self.dropout = nn.Dropout(dropout_rate) if dropout_rate > 0 else None
+
+    def _lif_step(self, membrane, current, beta, noise_std, spatial=False):
+        """One LIF timestep with optional membrane noise."""
+        beta_sig = torch.sigmoid(beta)
+        membrane = beta_sig * membrane + current
+
+        if self.training and noise_std > 0:
+            membrane = membrane + torch.randn_like(membrane) * noise_std
+
+        spikes = spike_fn(membrane - self.threshold)
+        membrane = membrane * (1 - spikes)
+        return membrane, spikes
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        device = x.device
+
+        # Compute conv features once (input doesn't change over time)
+        conv1_out = self.bn_conv1(self.conv1(x))
+        conv1_pooled_shape = self.pool1(torch.zeros_like(conv1_out)).shape
+
+        conv2_in_shape = (batch_size, self.conv2.in_channels,
+                          conv1_pooled_shape[2], conv1_pooled_shape[3])
+
+        # Init membrane potentials
+        mem_conv1 = torch.zeros_like(conv1_out)
+        mem_conv2 = torch.zeros(batch_size, self.conv2.out_channels,
+                                conv1_pooled_shape[2], conv1_pooled_shape[3],
+                                device=device)
+        mem_fc = torch.zeros(batch_size, self.hidden_size, device=device)
+
+        output_sum = torch.zeros(batch_size, 10, device=device)
+        total_spikes = 0
+        total_neurons = 0
+
+        for t in range(self.num_steps):
+            # Conv1 LIF
+            mem_conv1, spk_conv1 = self._lif_step(
+                mem_conv1, conv1_out, self.beta_conv1, self.noise_std)
+            if self.dropout:
+                spk_conv1 = self.dropout(spk_conv1)
+            pooled1 = self.pool1(spk_conv1)
+
+            # Conv2 LIF
+            conv2_current = self.bn_conv2(self.conv2(pooled1))
+            mem_conv2, spk_conv2 = self._lif_step(
+                mem_conv2, conv2_current, self.beta_conv2, self.noise_std)
+            if self.dropout:
+                spk_conv2 = self.dropout(spk_conv2)
+            pooled2 = self.pool2(spk_conv2)
+
+            # FC LIF
+            flat = pooled2.view(batch_size, -1)
+            fc_current = self.bn_fc(self.fc(flat))
+            mem_fc, spk_fc = self._lif_step(
+                mem_fc, fc_current, self.beta_fc, self.noise_std)
+            if self.dropout:
+                spk_fc = self.dropout(spk_fc)
+
+            # Accumulate output
+            output_sum += self.fc_out(spk_fc)
+
+            # Track spikes
+            total_spikes += spk_conv1.sum().item() + spk_conv2.sum().item() + spk_fc.sum().item()
+            total_neurons += spk_conv1.numel() + spk_conv2.numel() + spk_fc.numel()
+
+        output = output_sum / self.num_steps
+        activation_rate = total_spikes / total_neurons if total_neurons > 0 else 0
+
+        return output, activation_rate
+
+
+class BaselineANN(nn.Module):
+    """CNN ANN baseline for fair comparison."""
+    def __init__(self, config):
+        super().__init__()
+        c1 = config['conv1_filters']
+        c2 = config['conv2_filters']
+        ks = config['kernel_size']
+        pad = ks // 2
+
+        self.features = nn.Sequential(
+            nn.Conv2d(config['input_channels'], c1, ks, padding=pad),
+            nn.BatchNorm2d(c1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(c1, c2, ks, padding=pad),
+            nn.BatchNorm2d(c2),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+        )
+        flat_size = c2 * 7 * 7
+        self.classifier = nn.Sequential(
+            nn.Linear(flat_size, config['hidden_size']),
+            nn.BatchNorm1d(config['hidden_size']),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(config['hidden_size'], config['output_size']),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.view(x.size(0), -1)
+        return self.classifier(x)
+
+# ============================================================
+# DATA — with augmentation for higher accuracy
+# ============================================================
+
+def load_data(config):
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomAffine(degrees=5, translate=(0.05, 0.05)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.2860,), (0.3530,))
+    ])
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.2860,), (0.3530,))
+    ])
+
+    train_data = datasets.FashionMNIST('./data', train=True, download=True,
+                                        transform=train_transform)
+    test_data = datasets.FashionMNIST('./data', train=False, download=True,
+                                       transform=test_transform)
+
+    train_loader = DataLoader(train_data, batch_size=config['batch_size'],
+                              shuffle=True, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_data, batch_size=config['batch_size'],
+                             shuffle=False, num_workers=2, pin_memory=True)
+    return train_loader, test_loader
+
+# ============================================================
+# TRAINING & EVALUATION
+# ============================================================
+
+def train_model(model, train_loader, config, name="model", is_snn=True):
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, config['epochs'])
+    criterion = nn.CrossEntropyLoss()
+    device = config['device']
+    model = model.to(device)
+
+    print(f"\n  {name}:")
+    for epoch in range(config['epochs']):
+        model.train()
+        correct = 0
+        total = 0
+        total_loss = 0
+
+        for data, target in train_loader:
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            if is_snn:
+                output, _ = model(data)
+            else:
+                output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            if is_snn:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total_loss += loss.item()
+            _, predicted = output.max(1)
+            correct += predicted.eq(target).sum().item()
+            total += target.size(0)
+
+        scheduler.step()
+        acc = 100. * correct / total
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(f"    Epoch {epoch+1}/{config['epochs']}: "
+                  f"Loss={total_loss/len(train_loader):.4f}, Acc={acc:.1f}%")
+
+    return model
+
+
+def evaluate_model(model, test_loader, config, is_snn=True):
+    device = config['device']
+    model.eval()
+    model.to(device)
+
+    all_logits = []
+    all_probs = []
+    all_preds = []
+    all_targets = []
+    all_correct = []
+    total_act = 0
+    n_batches = 0
+
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            if is_snn:
+                output, act = model(data)
+                total_act += act
+                n_batches += 1
+            else:
+                output = model(data)
+
+            probs = F.softmax(output, dim=1)
+            pred = probs.argmax(dim=1)
+            all_logits.append(output.cpu())
+            all_probs.append(probs.cpu())
+            all_preds.append(pred.cpu())
+            all_targets.append(target.cpu())
+            all_correct.append(pred.eq(target).cpu())
+
+    return {
+        'logits': torch.cat(all_logits),
+        'probs': torch.cat(all_probs),
+        'preds': torch.cat(all_preds),
+        'targets': torch.cat(all_targets),
+        'correct': torch.cat(all_correct),
+        'accuracy': torch.cat(all_correct).float().mean().item(),
+        'activation_rate': total_act / n_batches if n_batches > 0 else 0,
+    }
+
+# ============================================================
+# SOFT VOTE WITH TEMPERATURE
+# ============================================================
+
+def soft_vote_temp(results_list, targets, temperature=1.0):
+    all_logits = torch.stack([r['logits'] for r in results_list])
+    all_correct = torch.stack([r['correct'] for r in results_list])
+
+    tempered = F.softmax(all_logits / temperature, dim=2)
+    mean_probs = tempered.mean(dim=0)
+    soft_preds = mean_probs.argmax(dim=1)
+    soft_correct = soft_preds.eq(targets)
+    soft_acc = soft_correct.float().mean().item()
+
+    # Emergence
+    all_wrong = (all_correct.sum(dim=0) == 0)
+    emergence_mask = all_wrong & soft_correct
+    emergence_count = emergence_mask.sum().item()
+
+    # Per-class
+    class_names = ['T-shirt', 'Trouser', 'Pullover', 'Dress', 'Coat',
+                   'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Boot']
+    per_class = {}
+    for c in range(10):
+        mask = (targets == c)
+        if mask.sum() > 0:
+            per_class[class_names[c]] = (emergence_mask & mask).sum().item()
+
+    # Emergence details
+    details = []
+    if emergence_count > 0:
+        all_preds = torch.stack([r['preds'] for r in results_list])
+        for idx in torch.where(emergence_mask)[0][:10]:
+            i = idx.item()
+            n_models = len(results_list)
+            ranks = []
+            for m in range(n_models):
+                p = tempered[m, i]
+                rank = (p > p[targets[i]]).sum().item() + 1
+                ranks.append(rank)
+            details.append({
+                'idx': i,
+                'true': targets[i].item(),
+                'pred': soft_preds[i].item(),
+                'avg_p': float(mean_probs[i, targets[i]]),
+                'ranks': ranks,
+                'ind_preds': [int(all_preds[m, i]) for m in range(n_models)],
+            })
+
+    return {
+        'accuracy': soft_acc,
+        'emergence_count': emergence_count,
+        'per_class': per_class,
+        'details': details,
+    }
+
+
+def error_correlation(results_list):
+    corrs = []
+    for i in range(len(results_list)):
+        for j in range(i+1, len(results_list)):
+            ei = (~results_list[i]['correct']).float()
+            ej = (~results_list[j]['correct']).float()
+            if ei.std() > 0 and ej.std() > 0:
+                c = torch.corrcoef(torch.stack([ei, ej]))[0, 1].item()
+                corrs.append(c)
+    return np.mean(corrs) if corrs else 0
+
+# ============================================================
+# MAIN
+# ============================================================
+
+CLASS_NAMES = ['T-shirt', 'Trouser', 'Pullover', 'Dress', 'Coat',
+               'Sandal', 'Shirt', 'Sneaker', 'Bag', 'Boot']
+
+def run_experiment():
+    config = CONFIG
+    print("=" * 65)
+    print("CONVOLUTIONAL SNN — ACCURACY + DIVERSITY + EMERGENCE")
+    print("=" * 65)
+
+    print("\n[1] Loading Fashion-MNIST (with augmentation)...")
+    train_loader, test_loader = load_data(config)
+
+    # ============================================================
+    # [2] TRAIN MODELS
+    # ============================================================
+    print("\n[2] Training models...")
+
+    # --- Single conv-SNN with noise (main architecture) ---
+    torch.manual_seed(42)
+    noisy_snn = ConvSNN(config, noise_std=config['noise_std'],
+                        dropout_rate=config['dropout_rate'])
+    noisy_snn = train_model(noisy_snn, train_loader, config,
+                            name="Conv-SNN (noisy)", is_snn=True)
+    noisy_result = evaluate_model(noisy_snn, test_loader, config, is_snn=True)
+    print(f"    → Test accuracy: {noisy_result['accuracy']*100:.1f}%, "
+          f"Activation: {noisy_result['activation_rate']:.3f}")
+
+    # --- Control conv-SNN without noise ---
+    torch.manual_seed(42)
+    ctrl_snn = ConvSNN(config, noise_std=0.0, dropout_rate=config['dropout_rate'])
+    ctrl_snn = train_model(ctrl_snn, train_loader, config,
+                           name="Conv-SNN (control)", is_snn=True)
+    ctrl_result = evaluate_model(ctrl_snn, test_loader, config, is_snn=True)
+    print(f"    → Test accuracy: {ctrl_result['accuracy']*100:.1f}%, "
+          f"Activation: {ctrl_result['activation_rate']:.3f}")
+
+    # --- CNN ANN baseline ---
+    torch.manual_seed(42)
+    ann = BaselineANN(config)
+    ann = train_model(ann, train_loader, config, name="CNN-ANN", is_snn=False)
+    ann_result = evaluate_model(ann, test_loader, config, is_snn=False)
+    print(f"    → Test accuracy: {ann_result['accuracy']*100:.1f}%")
+
+    # --- Diverse conv-SNNs (varied timesteps + noise) ---
+    # Based on hypothesis that timesteps create most diversity
+    diverse_configs = [
+        {'num_steps': 10, 'beta_init': 0.7, 'hidden_size': 256, 'label': 'fast-short'},
+        {'num_steps': 15, 'beta_init': 0.8, 'hidden_size': 256, 'label': 'medium'},
+        {'num_steps': 25, 'beta_init': 0.9, 'hidden_size': 256, 'label': 'standard'},
+        {'num_steps': 40, 'beta_init': 0.95, 'hidden_size': 256, 'label': 'slow-long'},
+        {'num_steps': 25, 'beta_init': 0.9, 'hidden_size': 128, 'label': 'small'},
+        {'num_steps': 25, 'beta_init': 0.9, 'hidden_size': 384, 'label': 'large'},
+    ]
+
+    diverse_models = []
+    diverse_results = []
+
+    print(f"\n  Training {len(diverse_configs)} diverse conv-SNNs...")
+    for i, dc in enumerate(diverse_configs):
+        torch.manual_seed(42 + i * 1000)
+        np.random.seed(42 + i * 1000)
+
+        model = ConvSNN(config, noise_std=config['noise_std'],
+                        dropout_rate=config['dropout_rate'],
+                        num_steps=dc['num_steps'],
+                        beta_init=dc['beta_init'],
+                        hidden_size=dc['hidden_size'])
+        model = train_model(model, train_loader, config,
+                            name=f"Diverse-{dc['label']}", is_snn=True)
+        result = evaluate_model(model, test_loader, config, is_snn=True)
+        diverse_models.append(model)
+        diverse_results.append(result)
+        print(f"    → {dc['label']}: {result['accuracy']*100:.1f}%, "
+              f"Act: {result['activation_rate']:.3f}")
+
+    # ============================================================
+    # [3] RESULTS
+    # ============================================================
+    targets = noisy_result['targets']
+
+    print(f"\n{'='*65}")
+    print("NOISE REGULARISATION — CONV-SNN")
+    print(f"{'='*65}")
+    print(f"  Control (no noise): {ctrl_result['accuracy']*100:.1f}%, "
+          f"Activation: {ctrl_result['activation_rate']:.3f}")
+    print(f"  Noisy:              {noisy_result['accuracy']*100:.1f}%, "
+          f"Activation: {noisy_result['activation_rate']:.3f}")
+    print(f"  Delta:              {(noisy_result['accuracy']-ctrl_result['accuracy'])*100:+.1f}% accuracy, "
+          f"{noisy_result['activation_rate']-ctrl_result['activation_rate']:+.3f} activation")
+    print(f"  CNN-ANN baseline:   {ann_result['accuracy']*100:.1f}%")
+
+    gap = (ann_result['accuracy'] - noisy_result['accuracy']) * 100
+    if gap <= 0:
+        print(f"\n  ✓ Conv-SNN MATCHES OR BEATS CNN-ANN!")
+    else:
+        print(f"\n  Gap to CNN-ANN: {gap:.1f}%")
+
+    # ============================================================
+    # [4] DIVERSITY ANALYSIS
+    # ============================================================
+    print(f"\n{'='*65}")
+    print("DIVERSE CONV-SNN ENSEMBLE")
+    print(f"{'='*65}")
+
+    print(f"\n  Individual results:")
+    print(f"  {'Label':<15} {'Steps':>5} {'Beta':>5} {'Hidden':>6} {'Acc':>7} {'Act':>6}")
+    print(f"  {'-'*50}")
+    for dc, r in zip(diverse_configs, diverse_results):
+        print(f"  {dc['label']:<15} {dc['num_steps']:>5} {dc['beta_init']:>5.2f} "
+              f"{dc['hidden_size']:>6} {r['accuracy']*100:>6.1f}% {r['activation_rate']:>5.3f}")
+
+    # Error correlation
+    corr = error_correlation(diverse_results)
+    print(f"\n  Mean error correlation: {corr:.4f}")
+
+    # Pairwise
+    print(f"\n  Pairwise correlations:")
+    labels = [dc['label'] for dc in diverse_configs]
+    print(f"  {'':>15}", end="")
+    for l in labels:
+        print(f" {l[:8]:>8}", end="")
+    print()
+    for i, li in enumerate(labels):
+        print(f"  {li:<15}", end="")
+        for j, lj in enumerate(labels):
+            if i == j:
+                print(f" {'—':>8}", end="")
+            elif j > i:
+                ei = (~diverse_results[i]['correct']).float()
+                ej = (~diverse_results[j]['correct']).float()
+                c = torch.corrcoef(torch.stack([ei, ej]))[0, 1].item()
+                print(f" {c:>8.3f}", end="")
+            else:
+                print(f" {'':>8}", end="")
+        print()
+
+    # ============================================================
+    # [5] TEMPERATURE SWEEP
+    # ============================================================
+    print(f"\n{'='*65}")
+    print("TEMPERATURE SWEEP — ALL DIVERSE CONV-SNNs")
+    print(f"{'='*65}")
+
+    print(f"\n  N={len(diverse_results)} networks")
+    print(f"  {'Temp':>6} | {'Accuracy':>8} | {'Emergence':>9} | {'Details'}")
+    print(f"  {'-'*60}")
+
+    best_emergence_temp = 1.0
+    best_emergence_count = 0
+
+    for temp in config['temperatures']:
+        sv = soft_vote_temp(diverse_results, targets, temperature=temp)
+        active = {k: v for k, v in sv['per_class'].items() if v > 0}
+        detail = ", ".join(f"{k}:{v}" for k, v in active.items()) if active else ""
+        print(f"  {temp:>6.2f} | {sv['accuracy']*100:>7.1f}% | "
+              f"{sv['emergence_count']:>9d} | {detail}")
+
+        if sv['emergence_count'] > best_emergence_count:
+            best_emergence_count = sv['emergence_count']
+            best_emergence_temp = temp
+
+    # Show emergence examples at best temperature
+    if best_emergence_count > 0:
+        sv = soft_vote_temp(diverse_results, targets, temperature=best_emergence_temp)
+        print(f"\n  Best emergence at T={best_emergence_temp}: {best_emergence_count} cases")
+        if sv['details']:
+            print(f"  {'Idx':>5} | {'True':>12} | {'Pred':>12} | {'Avg P':>6} | "
+                  f"{'Ranks':>25} | Individual preds")
+            print(f"  {'-'*85}")
+            for d in sv['details'][:10]:
+                true_name = CLASS_NAMES[d['true']]
+                pred_name = CLASS_NAMES[d['pred']]
+                print(f"  {d['idx']:>5} | {true_name:>12} | {pred_name:>12} | "
+                      f"{d['avg_p']:>5.3f} | {str(d['ranks']):>25} | {d['ind_preds']}")
+
+    # ============================================================
+    # [6] BEST PAIRS AND TRIOS
+    # ============================================================
+    print(f"\n{'='*65}")
+    print("BEST SUBSETS")
+    print(f"{'='*65}")
+
+    for n_ens in [2, 3, 4]:
+        best_acc = 0
+        best_combo = None
+
+        for combo_idx in combinations(range(len(diverse_results)), n_ens):
+            combo_r = [diverse_results[i] for i in combo_idx]
+            mean_p = torch.stack([r['probs'] for r in combo_r]).mean(dim=0)
+            acc = mean_p.argmax(dim=1).eq(targets).float().mean().item()
+            if acc > best_acc:
+                best_acc = acc
+                best_combo = combo_idx
+
+        combo_labels = [diverse_configs[i]['label'] for i in best_combo]
+        combo_results = [diverse_results[i] for i in best_combo]
+        combo_corr = error_correlation(combo_results)
+
+        print(f"\n  Best N={n_ens}: {best_acc*100:.1f}% | Corr: {combo_corr:.3f}")
+        print(f"    Members: {', '.join(combo_labels)}")
+
+        # Temperature sweep on best subset
+        print(f"    {'Temp':>6} | {'Acc':>6} | {'Emerge':>7}")
+        for temp in [0.5, 1.0, 2.0, 3.0, 5.0]:
+            sv = soft_vote_temp(combo_results, targets, temperature=temp)
+            print(f"    {temp:>6.1f} | {sv['accuracy']*100:>5.1f}% | {sv['emergence_count']:>7}")
+
+    # ============================================================
+    # [7] HARD CORE ANALYSIS
+    # ============================================================
+    print(f"\n{'='*65}")
+    print("HARD CORE ANALYSIS — Images no architecture gets right")
+    print(f"{'='*65}")
+
+    # Combine ALL results (noisy, control, ann, all diverse)
+    all_results = [noisy_result, ctrl_result] + diverse_results
+    all_correct_stack = torch.stack([r['correct'] for r in all_results])
+
+    # Images ALL models get wrong
+    n_models_total = len(all_results)
+    all_wrong = (all_correct_stack.sum(dim=0) == 0)
+    hard_core_count = all_wrong.sum().item()
+
+    # Images at least one model gets right
+    some_right = (~all_wrong).sum().item()
+
+    # Per-class hard core
+    print(f"\n  Total models compared: {n_models_total} "
+          f"({len(diverse_results)} diverse + noisy + control)")
+    print(f"  Hard core (ALL wrong): {hard_core_count} "
+          f"({hard_core_count/100:.1f}% of test set)")
+    print(f"  Recoverable (≥1 right): {some_right}")
+    print(f"  → Theoretical ceiling: {(10000-hard_core_count)/100:.1f}%")
+
+    print(f"\n  {'Class':<12} {'Hard core':>10} {'% of class':>10}")
+    print(f"  {'-'*35}")
+    for c in range(10):
+        mask = (targets == c)
+        class_hard = (all_wrong & mask).sum().item()
+        class_total = mask.sum().item()
+        print(f"  {CLASS_NAMES[c]:<12} {class_hard:>10} {class_hard/class_total*100:>9.1f}%")
+
+    # ============================================================
+    # [8] SUMMARY
+    # ============================================================
+    print(f"\n{'='*65}")
+    print("SUMMARY")
+    print(f"{'='*65}")
+
+    best_idx = max(range(len(diverse_results)),
+                   key=lambda i: diverse_results[i]['accuracy'])
+    best_individual = diverse_results[best_idx]
+    best_label = diverse_configs[best_idx]['label']
+
+    print(f"""
+  ACCURACY RESULTS:
+    CNN-ANN baseline:           {ann_result['accuracy']*100:.1f}%
+    Conv-SNN (noisy, single):   {noisy_result['accuracy']*100:.1f}%
+    Conv-SNN (control):         {ctrl_result['accuracy']*100:.1f}%
+    Best diverse individual:    {best_individual['accuracy']*100:.1f}% ({best_label})
+    Noise regularisation gain:  {(noisy_result['accuracy']-ctrl_result['accuracy'])*100:+.1f}%
+
+  DIVERSITY:
+    Error correlation:          {corr:.4f}
+    Best emergence count:       {best_emergence_count} (at T={best_emergence_temp})
+
+  EFFICIENCY:
+    Activation rate (noisy):    {noisy_result['activation_rate']:.3f}
+    Activation rate (control):  {ctrl_result['activation_rate']:.3f}
+
+  HARD CORE:
+    Unclassifiable images:      {hard_core_count} ({hard_core_count/100:.1f}%)
+    Theoretical ceiling:        {(10000-hard_core_count)/100:.1f}%
+
+  {'Conv-SNN matches CNN-ANN!' if noisy_result['accuracy'] >= ann_result['accuracy'] else f'Gap to CNN-ANN: {gap:.1f}% — room to improve'}
+    """)
+
+
+if __name__ == '__main__':
+    run_experiment()
