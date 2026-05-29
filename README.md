@@ -62,8 +62,7 @@ All experiments run on PyTorch. Colab T4 GPU is sufficient. Fashion-MNIST and CI
 
 ## Full writeup
 
-[Medium article](link)
+[Medium article](https://medium.com/@sergiyyun/inspired-by-quantum-stochasticity-of-the-brain-i-decided-to-test-an-idea-a9cf6b425b04)
 
----
 
-*Experiments designed by Sergiy Yun. Implementation in collaboration with Claude (Anthropic).*
+
